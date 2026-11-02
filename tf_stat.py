@@ -1,145 +1,245 @@
 import math
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import Tensor, nn
+from torch.nn import functional as F
 
+
+# ===== 时域分支：多尺度卷积提取各导联的局部波形特征 =====
 class TemporalBranch(nn.Module):
-    """时域多尺度卷积：3/5/7 并联，三路拼接成 d_model。"""
-    def __init__(self, d_model, kernel_sizes=(3, 5, 7)):
+    def __init__(self, d_model: int, kernel_sizes: tuple[int, ...]) -> None:
         super().__init__()
-        d = d_model // 3
-        d_last = d_model - 2 * d
-        k1, k2, k3 = kernel_sizes
-        self.conv3 = nn.Sequential(nn.Conv1d(1, d, k1, padding=k1 // 2, bias=False),
-                                   nn.BatchNorm1d(d), nn.ReLU(inplace=True))
-        self.conv5 = nn.Sequential(nn.Conv1d(1, d, k2, padding=k2 // 2, bias=False),
-                                   nn.BatchNorm1d(d), nn.ReLU(inplace=True))
-        self.conv7 = nn.Sequential(nn.Conv1d(1, d_last, k3, padding=k3 // 2, bias=False),
-                                   nn.BatchNorm1d(d_last), nn.ReLU(inplace=True))
+        if not kernel_sizes or d_model < len(kernel_sizes):
+            raise ValueError("嵌入维度必须足够分配给每个卷积分支")
+        if any(kernel < 1 or kernel % 2 == 0 for kernel in kernel_sizes):
+            raise ValueError("卷积核尺寸必须是正奇数")
 
-    def forward(self, x):                       # (B, 12, T)
-        B, L, T = x.shape
-        x = x.reshape(B * L, 1, T)
-        out = torch.cat([self.conv3(x), self.conv5(x), self.conv7(x)], dim=1)
-        return out.permute(0, 2, 1).reshape(B, L, T, -1)
+        widths = [d_model // len(kernel_sizes)] * len(kernel_sizes)
+        widths[-1] += d_model - sum(widths)
+        self.branches = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv1d(1, width, kernel, padding=kernel // 2, bias=False),
+                nn.BatchNorm1d(width),
+                nn.ReLU(inplace=True),
+            )
+            for width, kernel in zip(widths, kernel_sizes)
+        )
 
+    def forward(self, x: Tensor) -> Tensor:
+        batch, leads, samples = x.shape
+        signal = x.reshape(batch * leads, 1, samples)
+        features = torch.cat([branch(signal) for branch in self.branches], dim=1)
+        return features.transpose(1, 2).reshape(batch, leads, samples, -1)
+
+
+# ===== 频域分支：短时傅里叶变换与二维卷积 =====
 class FrequencyBranch(nn.Module):
-    """STFT → 2D CNN → 频率轴池化 → 线性投影回 d_model。"""
-    def __init__(self, d_model, n_fft=256, hop_length=64, target_T=1000):
+    def __init__(
+        self,
+        d_model: int,
+        n_fft: int,
+        hop_length: int,
+        cnn_channels: tuple[int, int],
+    ) -> None:
         super().__init__()
-        self.n_fft, self.hop_length, self.target_T = n_fft, hop_length, target_T
-        self.cnn2d = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1, bias=False), nn.BatchNorm2d(32), nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, 3, padding=1, bias=False), nn.BatchNorm2d(64), nn.ReLU(inplace=True))
-        self.freq_pool = nn.AdaptiveAvgPool2d((1, None))
-        self.proj = nn.Linear(64, d_model)
+        if n_fft < 2 or hop_length < 1 or len(cnn_channels) != 2 or any(
+            width < 1 for width in cnn_channels
+        ):
+            raise ValueError("频域分支配置无效")
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.register_buffer("window", torch.hann_window(n_fft), persistent=False)
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, cnn_channels[0], 3, padding=1, bias=False),
+            nn.BatchNorm2d(cnn_channels[0]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(cnn_channels[0], cnn_channels[1], 3, padding=1, bias=False),
+            nn.BatchNorm2d(cnn_channels[1]),
+            nn.ReLU(inplace=True),
+        )
+        self.proj = nn.Linear(cnn_channels[1], d_model)
 
-    def forward(self, x):
-        B, L, T = x.shape
-        window = torch.hann_window(self.n_fft, device=x.device)
-        spec = torch.stft(x.reshape(B * L, T).float(), n_fft=self.n_fft,
-                          hop_length=self.hop_length, win_length=self.n_fft,
-                          window=window, return_complex=True).abs().unsqueeze(1)
-        ff = self.freq_pool(self.cnn2d(spec)).squeeze(2)
-        if ff.shape[-1] != self.target_T:
-            ff = F.interpolate(ff, size=self.target_T, mode="linear", align_corners=False)
-        return self.proj(ff.permute(0, 2, 1)).reshape(B, L, T, -1)
+    def forward(self, x: Tensor) -> Tensor:
+        batch, leads, samples = x.shape
+        spectrum = torch.stft(
+            x.reshape(batch * leads, samples).float(),
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            window=self.window.float(),
+            return_complex=True,
+        ).abs().unsqueeze(1)
+        features = self.cnn(spectrum.to(self.cnn[0].weight.dtype)).mean(dim=2)
+        features = F.interpolate(features, size=samples, mode="linear", align_corners=False)
+        return self.proj(features.transpose(1, 2)).reshape(batch, leads, samples, -1)
 
+
+# ===== 门控融合：自适应合并时域与频域特征 =====
 class GatedFusion(nn.Module):
-    def __init__(self, d_model):
+    def __init__(self, d_model: int) -> None:
         super().__init__()
-        self.gate = nn.Linear(2 * d_model, d_model)
+        self.gate = nn.Linear(d_model * 2, d_model)
 
-    def forward(self, ft, ff):
-        a = torch.sigmoid(self.gate(torch.cat([ft, ff], dim=-1)))
-        return a * ft + (1 - a) * ff
+    def forward(self, temporal: Tensor, frequency: Tensor) -> Tensor:
+        weight = torch.sigmoid(self.gate(torch.cat((temporal, frequency), dim=-1)))
+        return weight * temporal + (1 - weight) * frequency
 
+
+# ===== 空间注意力：同一时间点上的导联间信息交互 =====
 class SpatialAttention(nn.Module):
-    """跨 12 导联的注意力（每个时间步独立）。"""
-    def __init__(self, d_model, num_heads):
+    def __init__(self, d_model: int, num_heads: int) -> None:
         super().__init__()
-        assert d_model % num_heads == 0
-        self.num_heads, self.d_h = num_heads, d_model // num_heads
-        self.scale = math.sqrt(self.d_h)
-        self.wq, self.wk, self.wv = (nn.Linear(d_model, d_model) for _ in range(3))
-        self.out_proj = nn.Linear(d_model, d_model)
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.query = nn.Linear(d_model, d_model)
+        self.key = nn.Linear(d_model, d_model)
+        self.value = nn.Linear(d_model, d_model)
+        self.output = nn.Linear(d_model, d_model)
 
-    def forward(self, x):
-        B, L, T, D = x.shape
-        xr = x.permute(0, 2, 1, 3).reshape(B * T, L, D)
-        head = lambda w: w(xr).reshape(B * T, L, self.num_heads, self.d_h).permute(0, 2, 1, 3)
-        q, k, v = head(self.wq), head(self.wk), head(self.wv)
-        attn = F.softmax(q @ k.transpose(-1, -2) / self.scale, dim=-1)
-        out = (attn @ v).transpose(1, 2).reshape(B * T, L, D)
-        return self.out_proj(out).reshape(B, T, L, D).permute(0, 2, 1, 3)
+    def forward(self, x: Tensor, return_lead_scores: bool = False) -> tuple[Tensor, Tensor | None]:
+        batch, leads, samples, width = x.shape
+        tokens = x.permute(0, 2, 1, 3).reshape(batch * samples, leads, width)
 
+        def split(projection: nn.Linear) -> Tensor:
+            return projection(tokens).reshape(
+                batch * samples, leads, self.num_heads, self.head_dim
+            ).transpose(1, 2)
+
+        query, key, value = split(self.query), split(self.key), split(self.value)
+        lead_scores = None
+        if return_lead_scores:
+            weights = torch.softmax(
+                query @ key.transpose(-1, -2) / math.sqrt(self.head_dim), dim=-1
+            )
+            attended = weights @ value
+            lead_scores = weights.mean(dim=(1, 2)).reshape(batch, samples, leads).mean(dim=1)
+        else:
+            attended = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0)
+
+        attended = attended.transpose(1, 2).reshape(batch * samples, leads, width)
+        result = self.output(attended).reshape(batch, samples, leads, width)
+        return result.permute(0, 2, 1, 3), lead_scores
+
+
+# ===== 级联时间注意力的单个头：生成 Q/K/V 并细化查询 =====
 class CascadedTemporalHead(nn.Module):
-    """级联时间注意力的单个头：q 在上一头输出上再细化一次。"""
-    def __init__(self, d_h):
+    def __init__(self, head_dim: int) -> None:
         super().__init__()
-        self.scale = math.sqrt(d_h)
-        self.q_proj = nn.Conv1d(d_h, d_h, 1)
-        self.k_proj = nn.Conv1d(d_h, d_h, 1)
-        self.v_proj = nn.Conv1d(d_h, d_h, 1)
-        self.q_refine = nn.Conv1d(d_h, d_h, 1)
+        self.query = nn.Conv1d(head_dim, head_dim, 1)
+        self.key = nn.Conv1d(head_dim, head_dim, 1)
+        self.value = nn.Conv1d(head_dim, head_dim, 1)
+        self.query_refine = nn.Conv1d(head_dim, head_dim, 1)
 
-    def forward(self, z):                       # (N, d_h, T)
-        q = self.q_refine(self.q_proj(z)).transpose(1, 2)
-        k = self.k_proj(z).transpose(1, 2)
-        v = self.v_proj(z).transpose(1, 2)
-        return torch.bmm(F.softmax(q @ k.transpose(1, 2) / self.scale, dim=-1), v)
+    def forward(self, x: Tensor) -> Tensor:
+        channels_first = x.transpose(1, 2)
+        query = self.query_refine(self.query(channels_first)).transpose(1, 2)
+        key = self.key(channels_first).transpose(1, 2)
+        value = self.value(channels_first).transpose(1, 2)
+        return F.scaled_dot_product_attention(
+            query.unsqueeze(1), key.unsqueeze(1), value.unsqueeze(1), dropout_p=0.0
+        ).squeeze(1)
 
+
+# ===== 级联时间注意力：后一头接收前一头的输出 =====
 class CascadedTemporalAttention(nn.Module):
-    def __init__(self, d_model, num_heads):
+    def __init__(self, d_model: int, num_heads: int) -> None:
         super().__init__()
-        self.d_h, self.num_heads = d_model // num_heads, num_heads
-        self.heads = nn.ModuleList([CascadedTemporalHead(self.d_h) for _ in range(num_heads)])
-        self.out_proj = nn.Conv1d(d_model, d_model, 1)
+        head_dim = d_model // num_heads
+        self.heads = nn.ModuleList(CascadedTemporalHead(head_dim) for _ in range(num_heads))
+        self.output = nn.Conv1d(d_model, d_model, 1)
 
-    def forward(self, x):
-        prev, outs = None, []
-        for i, (head, g) in enumerate(zip(self.heads, x.split(self.d_h, dim=-1))):
-            z = g if i == 0 else g + prev          # 级联：上一头的输出传给下一头
-            prev = head(z.transpose(1, 2))
-            outs.append(prev)
-        y = torch.cat(outs, dim=-1).transpose(1, 2)
-        return self.out_proj(F.relu(y)).transpose(1, 2)
+    def forward(self, x: Tensor) -> Tensor:
+        previous = None
+        outputs = []
+        for group, head in zip(x.chunk(len(self.heads), dim=-1), self.heads):
+            previous = head(group if previous is None else group + previous)
+            outputs.append(previous)
+        joined = torch.cat(outputs, dim=-1)
+        return self.output(F.relu(joined).transpose(1, 2)).transpose(1, 2)
 
+
+# ===== 时空解耦模块：并行处理导联关系与时间关系 =====
 class DecoupledBlock(nn.Module):
-    """空间与时间注意力解耦并联，再各自残差 + FFN。"""
-    def __init__(self, d_model, num_heads, ffn_dim, dropout=0.3):
+    def __init__(self, d_model: int, num_heads: int, ffn_dim: int, dropout: float) -> None:
         super().__init__()
         self.spatial = SpatialAttention(d_model, num_heads)
         self.temporal = CascadedTemporalAttention(d_model, num_heads)
-        self.norm1, self.norm2 = nn.LayerNorm(d_model), nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(nn.Linear(d_model, ffn_dim), nn.GELU(), nn.Dropout(dropout),
-                                 nn.Linear(ffn_dim, d_model), nn.Dropout(dropout))
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, ffn_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, d_model),
+            nn.Dropout(dropout),
+        )
 
-    def forward(self, x):
-        B, L, T, D = x.shape
-        Hs = self.spatial(x)
-        Ht = self.temporal(x.reshape(B * L, T, D)).reshape(B, L, T, D)
-        h = self.norm1(x + Hs + Ht)
-        return self.norm2(h + self.ffn(h))
+    def forward(self, x: Tensor, return_lead_scores: bool = False) -> tuple[Tensor, Tensor | None]:
+        batch, leads, samples, width = x.shape
+        spatial, lead_scores = self.spatial(x, return_lead_scores)
+        temporal = self.temporal(x.reshape(batch * leads, samples, width)).reshape(
+            batch, leads, samples, width
+        )
+        hidden = self.norm1(x + spatial + temporal)
+        return self.norm2(hidden + self.ffn(hidden)), lead_scores
 
+
+# ===== 完整核心网络：时频融合后依次通过多个解耦模块 =====
 class TFSTAT(nn.Module):
-    def __init__(self, num_classes=2, d_model=512, num_heads=8, num_layers=1,
-                 ffn_dim=2048, dropout=0.3, num_leads=12, seq_len=1000,
-                 n_fft=256, hop_length=64, kernel_sizes=(3, 5, 7)):
+    def __init__(
+        self,
+        *,
+        num_leads: int,
+        seq_len: int,
+        num_classes: int,
+        d_model: int,
+        num_heads: int,
+        num_layers: int,
+        ffn_dim: int,
+        classifier_dim: int,
+        kernel_sizes: tuple[int, ...],
+        n_fft: int,
+        hop_length: int,
+        cnn_channels: tuple[int, int],
+        dropout: float,
+    ) -> None:
         super().__init__()
-        self.tf_repr = nn.ModuleDict({
-            "temporal": TemporalBranch(d_model, kernel_sizes),
-            "freq": FrequencyBranch(d_model, n_fft, hop_length, seq_len),
-            "fusion": GatedFusion(d_model)})
-        self.blocks = nn.ModuleList([DecoupledBlock(d_model, num_heads, ffn_dim, dropout)
-                                     for _ in range(num_layers)])
+        if d_model < 1 or num_heads < 1 or d_model % num_heads != 0:
+            raise ValueError("嵌入维度必须能被注意力头数整除")
+        if num_layers < 1 or seq_len < n_fft or num_leads < 1:
+            raise ValueError("层数、输入长度或导联数无效")
+        if num_classes < 1 or classifier_dim < 1 or ffn_dim < 1:
+            raise ValueError("分类头或前馈网络维度无效")
+
+        self.num_leads = num_leads
+        self.seq_len = seq_len
+        self.temporal = TemporalBranch(d_model, kernel_sizes)
+        self.frequency = FrequencyBranch(d_model, n_fft, hop_length, cnn_channels)
+        self.fusion = GatedFusion(d_model)
+        self.blocks = nn.ModuleList(
+            DecoupledBlock(d_model, num_heads, ffn_dim, dropout)
+            for _ in range(num_layers)
+        )
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-        self.classifier = nn.Sequential(nn.Linear(d_model, d_model // 2), nn.ReLU(inplace=True),
-                                        nn.Dropout(dropout), nn.Linear(d_model // 2, num_classes))
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, classifier_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(classifier_dim, num_classes),
+        )
 
-    def forward(self, x):
-        f = self.tf_repr["fusion"](self.tf_repr["temporal"](x), self.tf_repr["freq"](x))
-        for blk in self.blocks:
-            f = blk(f)
-        return self.classifier(self.dropout(self.norm(f).mean(dim=(1, 2))))
+    def forward(self, x: Tensor, return_lead_scores: bool = False) -> Tensor | tuple[Tensor, Tensor]:
+        if x.ndim != 3 or x.shape[1:] != (self.num_leads, self.seq_len):
+            raise ValueError("输入形状与模型配置不一致")
+
+        features = self.fusion(self.temporal(x), self.frequency(x))
+        scores = []
+        for block in self.blocks:
+            features, lead_scores = block(features, return_lead_scores)
+            if lead_scores is not None:
+                scores.append(lead_scores)
+
+        logits = self.classifier(self.dropout(self.norm(features).mean(dim=(1, 2))))
+        if return_lead_scores:
+            return logits, torch.stack(scores).mean(dim=0)
+        return logits
