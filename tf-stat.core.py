@@ -5,14 +5,14 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 
-# ===== 时域分支：多尺度卷积提取各导联的局部波形特征 =====
+# ===== Temporal branch: multiscale convolutions extract local features from each lead =====
 class TemporalBranch(nn.Module):
     def __init__(self, d_model: int, kernel_sizes: tuple[int, ...]) -> None:
         super().__init__()
         if not kernel_sizes or d_model < len(kernel_sizes):
-            raise ValueError("嵌入维度必须足够分配给每个卷积分支")
+            raise ValueError("Embedding dimension must provide channels for every convolution branch")
         if any(kernel < 1 or kernel % 2 == 0 for kernel in kernel_sizes):
-            raise ValueError("卷积核尺寸必须是正奇数")
+            raise ValueError("Convolution kernel sizes must be positive odd integers")
 
         widths = [d_model // len(kernel_sizes)] * len(kernel_sizes)
         widths[-1] += d_model - sum(widths)
@@ -32,7 +32,7 @@ class TemporalBranch(nn.Module):
         return features.transpose(1, 2).reshape(batch, leads, samples, -1)
 
 
-# ===== 频域分支：短时傅里叶变换与二维卷积 =====
+# ===== Frequency branch: short-time Fourier transform and 2D convolutions =====
 class FrequencyBranch(nn.Module):
     def __init__(
         self,
@@ -45,7 +45,7 @@ class FrequencyBranch(nn.Module):
         if n_fft < 2 or hop_length < 1 or len(cnn_channels) != 2 or any(
             width < 1 for width in cnn_channels
         ):
-            raise ValueError("频域分支配置无效")
+            raise ValueError("Invalid frequency branch configuration")
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.register_buffer("window", torch.hann_window(n_fft), persistent=False)
@@ -73,7 +73,7 @@ class FrequencyBranch(nn.Module):
         return self.proj(features.transpose(1, 2)).reshape(batch, leads, samples, -1)
 
 
-# ===== 门控融合：自适应合并时域与频域特征 =====
+# ===== Gated fusion: adaptively combine temporal and frequency features =====
 class GatedFusion(nn.Module):
     def __init__(self, d_model: int) -> None:
         super().__init__()
@@ -84,7 +84,7 @@ class GatedFusion(nn.Module):
         return weight * temporal + (1 - weight) * frequency
 
 
-# ===== 空间注意力：同一时间点上的导联间信息交互 =====
+# ===== Spatial attention: exchange information across leads at each time step =====
 class SpatialAttention(nn.Module):
     def __init__(self, d_model: int, num_heads: int) -> None:
         super().__init__()
@@ -120,7 +120,7 @@ class SpatialAttention(nn.Module):
         return result.permute(0, 2, 1, 3), lead_scores
 
 
-# ===== 级联时间注意力的单个头：生成 Q/K/V 并细化查询 =====
+# ===== Single cascaded temporal head: generate Q/K/V and refine the query =====
 class CascadedTemporalHead(nn.Module):
     def __init__(self, head_dim: int) -> None:
         super().__init__()
@@ -139,7 +139,7 @@ class CascadedTemporalHead(nn.Module):
         ).squeeze(1)
 
 
-# ===== 级联时间注意力：后一头接收前一头的输出 =====
+# ===== Cascaded temporal attention: each head receives the previous head's output =====
 class CascadedTemporalAttention(nn.Module):
     def __init__(self, d_model: int, num_heads: int) -> None:
         super().__init__()
@@ -157,7 +157,7 @@ class CascadedTemporalAttention(nn.Module):
         return self.output(F.relu(joined).transpose(1, 2)).transpose(1, 2)
 
 
-# ===== 时空解耦模块：并行处理导联关系与时间关系 =====
+# ===== Decoupled block: model inter-lead and temporal relationships in parallel =====
 class DecoupledBlock(nn.Module):
     def __init__(self, d_model: int, num_heads: int, ffn_dim: int, dropout: float) -> None:
         super().__init__()
@@ -183,7 +183,7 @@ class DecoupledBlock(nn.Module):
         return self.norm2(hidden + self.ffn(hidden)), lead_scores
 
 
-# ===== 完整核心网络：时频融合后依次通过多个解耦模块 =====
+# ===== Core network: pass fused features through decoupled blocks sequentially =====
 class TFSTAT(nn.Module):
     def __init__(
         self,
@@ -204,11 +204,11 @@ class TFSTAT(nn.Module):
     ) -> None:
         super().__init__()
         if d_model < 1 or num_heads < 1 or d_model % num_heads != 0:
-            raise ValueError("嵌入维度必须能被注意力头数整除")
+            raise ValueError("Embedding dimension must be divisible by the number of attention heads")
         if num_layers < 1 or seq_len < n_fft or num_leads < 1:
-            raise ValueError("层数、输入长度或导联数无效")
+            raise ValueError("Invalid number of layers, input length, or number of leads")
         if num_classes < 1 or classifier_dim < 1 or ffn_dim < 1:
-            raise ValueError("分类头或前馈网络维度无效")
+            raise ValueError("Invalid classifier or feed-forward network dimension")
 
         self.num_leads = num_leads
         self.seq_len = seq_len
@@ -230,7 +230,7 @@ class TFSTAT(nn.Module):
 
     def forward(self, x: Tensor, return_lead_scores: bool = False) -> Tensor | tuple[Tensor, Tensor]:
         if x.ndim != 3 or x.shape[1:] != (self.num_leads, self.seq_len):
-            raise ValueError("输入形状与模型配置不一致")
+            raise ValueError("Input shape does not match the model configuration")
 
         features = self.fusion(self.temporal(x), self.frequency(x))
         scores = []
